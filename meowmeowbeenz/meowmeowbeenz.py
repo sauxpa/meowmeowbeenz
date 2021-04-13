@@ -6,6 +6,7 @@ import networkx as nx
 from functools import lru_cache
 from copy import copy
 from tqdm import tqdm
+from typing import List
 
 
 RATINGS = [1, 2, 3, 4, 5]
@@ -16,12 +17,8 @@ MIN_RATING = 1
 class MeowRandomRatings(abc.ABC):
     """Generic class to simulate random MeowMeowBeenz rating dynamics.
     """
-    def __init__(self,
-                 G: nx.Graph,
-                 rating_distr: list,
-                 ) -> None:
+    def __init__(self, G: nx.Graph):
         self._G = G
-        self._rating_distr = rating_distr
 
         self.X = np.empty(0)
         self.ratings = np.empty(0)
@@ -37,14 +34,6 @@ class MeowRandomRatings(abc.ABC):
     def G(self, new_G: nx.Graph) -> None:
         self.flush_graph()
         self._G = new_G
-
-    @property
-    def rating_distr(self) -> list:
-        return self._rating_distr
-
-    @rating_distr.setter
-    def rating_distr(self, new_rating_distr: list):
-        self._rating_distr = new_rating_distr
 
     @property
     def N(self) -> int:
@@ -87,7 +76,7 @@ class MeowRandomRatings(abc.ABC):
 
     @property
     @lru_cache(maxsize=None)
-    def spectrum(self) -> np.ndarray:
+    def spectrum(self) -> List:
         """Calculate and cache adjacency spectrum
         (sorted in decreasing order).
         """
@@ -169,12 +158,35 @@ class MeowRandomRatings(abc.ABC):
         else:
             raise ValueError('Unknown mode : {:s}'.format(mode))
 
+    def generate_new_rating(self,
+                            mode,
+                            receiver,
+                            giver,
+                            params,
+                            ):
+        if mode == 'random':
+            rating_distr = params.get('rating_distr')
+            return np.random.choice(RATINGS, p=rating_distr)
+        elif mode == 'retaliate':
+            rating_distr_base = np.array(params.get('rating_distr'))
+            alpha = params.get('alpha')
+            rating_distr = (
+                alpha * self.grudges[receiver][giver]
+                + (1 - alpha) * rating_distr_base
+                )
+            rating_distr /= np.sum(rating_distr)
+            return np.random.choice(RATINGS, p=rating_distr)
+        else:
+            raise ValueError('Unknown mode : {:s}'.format(mode))
+
     def simulate(self,
                  T: int,
-                 x0: np.ndarray = np.empty(0),
+                 x0: List = np.empty(0),
                  buffer_size: int = -1,
-                 mode: str = '',
-                 params: dict = {},
+                 weight_mode: str = '',
+                 weight_params: dict = {},
+                 rating_mode: str = '',
+                 rating_params: dict = {},
                  verbose: bool = False,
                  ) -> None:
         """Simulate rating dynamic for T steps.
@@ -198,25 +210,49 @@ class MeowRandomRatings(abc.ABC):
         self.giver_history = np.empty(T)
         self.receiver_history = np.empty(T)
 
+        grudge_management = rating_mode == 'retaliate'
+        if grudge_management:
+            self.grudges = dict()
+            for receiver in self.nodes_list:
+                grudges_node = dict()
+                for giver in self.G.neighbors(receiver):
+                    grudges_node[giver] = np.zeros(len(RATINGS))
+                self.grudges[receiver] = grudges_node
+        else:
+            self.grudges = None
+
         for t in tqdm(range(1, T + 1), disable=not verbose):
+            # Pick a random edge (receiver, giver)
             idx_edge = np.random.randint(self.N_edges)
             receiver, giver = self.edges_list[idx_edge]
 
             self.giver_history[t - 1] = giver
             self.receiver_history[t - 1] = receiver
 
-            new_rating = np.random.choice(RATINGS, p=self.rating_distr)
+            # Generate new rating from giver to receiver
+            new_rating = self.generate_new_rating(
+                rating_mode,
+                receiver,
+                giver,
+                rating_params,
+                )
+
+            # Generate weight for the newly generated rating
             weights_history[receiver].append(
                 self.weight(
                     new_rating,
                     ratings_t[receiver],
                     ratings_t[giver],
-                    mode,
-                    params,
+                    weight_mode,
+                    weight_params,
                     )
                 )
             rating_history[receiver].append(new_rating)
+            if grudge_management:
+                new_rating_idx = int(new_rating - 1)
+                self.grudges[receiver][giver][new_rating_idx] += 1
 
+            # Trim buffer of past ratings if need be
             if buffer_size > 0 and len(rating_history[receiver]) > buffer_size:
                 rating_history[receiver].popleft()
                 weights_history[receiver].popleft()
